@@ -2,100 +2,198 @@
 
 ## Purpose
 
-NetProbe reports observations from individual connectivity checks. A successful early stage does not guarantee that later stages will succeed.
+NetProbe evaluates network connectivity through a sequence of diagnostic
+checks. Each check produces an observation about a particular operation,
+such as DNS resolution, a TCP connection, a TLS handshake, or an HTTP
+request.
 
-DNS can succeed while TCP fails. TCP can succeed while TLS fails. TLS can succeed while an HTTP server returns an error response.
+The diagnostic model preserves individual observations and derives an
+overall status from the checks designated as required.
 
-## Diagnostic Stages
+The model separates three concerns:
 
-### Input validation
+1. Individual check execution and evidence collection.
+2. Aggregation of check results into an overall diagnostic status.
+3. Translation of the overall status into a process exit code.
 
-Validate the target and requested options before initiating network operations.
+This separation allows the diagnostic policy to be tested independently
+of network operations and command-line execution.
 
-### DNS resolution
+## Individual Results
 
-Record the queried hostname, returned addresses, address families, duration, and resolver errors where available.
+Each diagnostic result contains:
 
-Successful resolution proves that addresses were returned. It does not prove those addresses are reachable.
+- `name`: a stable identifier for the check.
+- `status`: the outcome of the check.
+- `required`: whether the check must pass for the overall diagnostic to
+  succeed.
+- `duration_ns`: the duration of the check in nanoseconds when serialized
+  as JSON.
+- `message`: a concise description of the outcome.
+- `error`: optional error information.
+- `details`: optional structured evidence.
 
-### Address-family classification
+The internal implementation represents durations using Go's
+`time.Duration`. JSON output uses an integer field named `duration_ns`
+to make the unit explicit.
 
-Classify returned addresses as IPv4 or IPv6. Preserve the destination address and family in subsequent results.
+### Result Statuses
 
-If the hostname has no address for one family, report that the family could not be tested for this target. Do not conclude that the host generally lacks connectivity through that family.
+#### Passed
 
-### TCP connection
+The check satisfied its defined success condition.
 
-Attempt a bounded connection to the selected destination and port.
+A successful DNS lookup, for example, establishes that the resolver
+returned addresses. It does not establish that those addresses are
+reachable.
 
-Record the destination, address family, duration, outcome, and error details.
+#### Failed
 
-A successful TCP connection establishes connectivity to that destination and port at that time. It does not prove TLS or application-level success.
+The check produced evidence that its success condition was not satisfied.
 
-Connection refusal, timeout, and network-unreachable errors are distinct observations and should remain distinguishable where possible.
+A TCP connection refusal is a concrete connection failure. It does not,
+by itself, establish why the remote endpoint refused the connection.
 
-### TLS negotiation
+#### Skipped
 
-For HTTPS targets, attempt TLS after TCP succeeds.
+The check was not executed because it was not applicable or its
+prerequisites were unavailable.
 
-Record handshake success or failure, duration, and relevant protocol or certificate errors.
+A skipped check does not automatically establish a network failure.
+However, a required check that is skipped prevents NetProbe from claiming
+that all required checks passed.
 
-Use the intended hostname for SNI and certificate verification. Certificate verification must remain enabled by default.
+#### Inconclusive
 
-A TLS failure does not automatically establish its root cause.
+The check ran but could not establish success or failure under its
+defined evaluation rules.
 
-### HTTP response
+A timeout may produce an inconclusive result when the available evidence
+does not establish the underlying cause.
 
-For HTTP and HTTPS targets, send a bounded request when prerequisites permit.
+The distinction between failed and inconclusive outcomes must follow the
+semantics of the individual check. It must not be used to disguise an
+ordinary connection failure as an internal error.
 
-Record whether a response was received, the status code, duration, and request errors.
+## Required and Optional Checks
 
-An HTTP response demonstrates that an HTTP endpoint responded. It does not necessarily establish application health.
+A result's `required` field determines whether its status contributes
+directly to the overall diagnostic status.
 
-## Check Outcomes
+Required checks represent the conditions that must be satisfied for the
+diagnostic to be considered successful.
 
-Each check should support these outcomes:
+Optional checks provide additional information. Their results remain
+visible in the report, but an optional failure does not override an
+otherwise successful set of required checks.
 
-- **Passed:** the defined success condition was observed.
-- **Failed:** the check ran, but its success condition was not met.
-- **Skipped:** the check was not run because it was inapplicable or a prerequisite was unavailable.
-- **Inconclusive:** the available evidence was insufficient to determine the outcome.
+The required-check policy must be established by the diagnostic
+configuration and documented for each supported invocation.
 
-Each result should include a concise explanation. Errors belong to the stage that produced them.
-
-A skipped check is not a successful check.
-
-## Partial Success
-
-Preserve individual results when checks have different outcomes.
-
-Examples:
-
-- DNS succeeds, IPv4 TCP succeeds, and IPv6 TCP fails.
-- TCP succeeds but TLS fails.
-- TLS succeeds and the server returns HTTP 503.
-
-Do not collapse these outcomes into a single ambiguous statement such as "the network failed."
+A result must not be marked optional merely to make an unsuccessful
+diagnostic return success.
 
 ## Overall Status
 
-Derive the overall summary from individual results. The exact aggregation rules and process exit codes must be defined and tested before the first release.
+The report derives its overall status from the complete set of results.
 
-The summary must not hide partial connectivity or claim an unsupported root cause.
+Aggregation follows these rules in order:
 
-## Timing
+1. If any required check failed, the overall status is `failed`.
+2. Otherwise, if any required check was inconclusive or skipped, the
+   overall status is `inconclusive`.
+3. If there are no required checks, the overall status is `inconclusive`.
+4. Otherwise, all required checks passed and the overall status is
+   `passed`.
 
-Use Go's monotonic timing facilities for measuring elapsed durations.
+An empty result set is therefore inconclusive.
 
-DNS, TCP, TLS, and HTTP durations must describe their respective operations. A timeout must be bounded and represented explicitly.
+Optional results do not change the overall status when all required
+checks pass. They are still retained in the report and must remain
+available to users and programmatic consumers.
 
-## Evidence and Conclusions
+### Partial Success
 
-Keep these concepts distinct:
+NetProbe must preserve the result of each individual check.
 
-- **Observation:** what the check directly returned.
-- **Interpretation:** what the observation supports.
-- **Hypothesis:** a possible explanation requiring further tests.
-- **Root cause:** an explanation supported by sufficient evidence.
+For example, a target may have working IPv4 connectivity and failing
+IPv6 connectivity. The report must retain both observations rather than
+collapsing them into a single Boolean value.
 
-For example, a gateway returning a network-unreachable error supports the conclusion that the tested destination was unreachable through that observed path at that time. It does not, by itself, locate the fault in the guest, hypervisor, host, gateway, or upstream network.
+The overall status depends on which checks are required for the
+invocation. The result collection must not discard useful partial success
+or conceal an individual failure.
+
+## Process Exit Codes
+
+The CLI maps the overall report status to a process exit code.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | All required, applicable checks passed. |
+| `1` | A required check failed, the result was inconclusive, or no required checks established success. |
+| `2` | Invalid command-line arguments or configuration. |
+| `3` | An internal error prevented production of a valid diagnostic report. |
+
+Exit codes `2` and `3` are reserved for errors handled by the CLI layer.
+They are not ordinary network-check outcomes.
+
+A failed TCP connection, for example, should normally appear as a valid
+diagnostic result and contribute to exit code `1` when that check is
+required. It should not be treated as an internal execution error.
+
+The diagnostic package does not terminate the process. It returns the
+report and exposes the exit-code decision. Process termination belongs
+to the CLI entry point.
+
+## Report Structure
+
+A report contains:
+
+- `target`: the requested diagnostic target.
+- `started_at`: the diagnostic start timestamp.
+- `duration_ns`: the total diagnostic duration in nanoseconds.
+- `status`: the derived overall status.
+- `results`: the ordered collection of individual results.
+
+The report validates its basic fields and individual results. It also
+checks that the stored overall status agrees with the aggregation policy.
+
+Individual result ordering should reflect the diagnostic execution plan
+so that consumers can interpret the sequence consistently.
+
+## Evidence and Interpretation
+
+NetProbe distinguishes observations from interpretations.
+
+An observation describes what a check directly established. An
+interpretation explains what those observations may imply. A root-cause
+claim requires sufficient evidence to identify the underlying fault.
+
+For example:
+
+- Observation: the host resolved an AAAA record.
+- Observation: a TCP connection to the selected IPv6 destination failed.
+- Possible interpretation: IPv6 connectivity may be unavailable along
+  the tested path.
+- Root cause: not established by those observations alone.
+
+The diagnostic model must not imply that DNS success proves reachability,
+that gateway reachability proves external connectivity, or that a
+connection failure uniquely identifies the responsible network component.
+
+## Implementation Boundaries
+
+The diagnostic model is independent of network operations.
+
+Network checks are responsible for executing bounded operations and
+producing individual results. The diagnostic layer retains those results
+and derives the overall status. The reporting layer serializes the
+report, while the CLI handles argument errors, internal failures, and
+process exit.
+
+Unit tests for result validation and aggregation must not depend on public
+Internet access.
+
+Changes to result statuses, required-check semantics, aggregation rules,
+or exit codes must be reflected in both the tests and this document.
