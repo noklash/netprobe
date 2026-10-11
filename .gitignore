@@ -1,0 +1,17 @@
+# Compiled binaries
+/netprobe
+/netprobe.exe
+*.out
+
+# Test and coverage artifacts
+coverage.out
+coverage.html
+
+# Local environment files
+.env
+.env.*
+
+# Editor and operating-system artifacts
+.idea/
+.vscode/
+.DS_Store
