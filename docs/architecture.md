@@ -2,170 +2,250 @@
 
 ## Purpose
 
-NetProbe is a one-shot command-line tool for diagnosing outbound network connectivity. It examines individual connection stages and preserves the evidence collected at each stage.
+NetProbe is a one-shot network connectivity diagnostic tool written in Go. It investigates individual stages of outbound connectivity and preserves the evidence collected at each stage.
 
-The design separates individual diagnostic checks from orchestration, result aggregation, and report rendering. This allows each check to be tested independently and makes it possible to retain useful evidence when one stage fails.
+The current implementation provides DNS resolution, address-specific TCP connectivity checks, optional TLS handshake and certificate verification, diagnostic result aggregation, and a runner that coordinates these operations.
+
+The command-line interface, HTTP response diagnostics, and user-facing report rendering are not yet implemented.
+
+The architecture separates individual network checks, diagnostic orchestration, result aggregation, and eventual presentation. This keeps network behavior independently testable and prevents a failure at one stage from erasing useful evidence collected at another.
 
 ## Design Goals
 
-- Separate diagnostic orchestration from individual network checks.
-- Preserve successful results when other checks fail.
-- Evaluate IPv4 and IPv6 independently.
+- Separate network checks from diagnostic orchestration.
+- Preserve individual outcomes and partial success.
+- Evaluate resolved IP addresses independently.
+- Keep IPv4 and IPv6 results distinct.
 - Bound network operations with explicit timeouts and context cancellation.
-- Record errors, operation durations, and relevant diagnostic details.
-- Support human-readable and JSON reports.
-- Test core behavior without depending on public Internet access.
+- Distinguish operational network outcomes from invalid configuration and internal errors.
+- Represent skipped and inconclusive checks explicitly.
+- Retain structured evidence and operation durations.
+- Support deterministic tests without routine dependence on public Internet services.
+- Avoid conclusions that exceed the available evidence.
 - Minimize external dependencies.
-- Distinguish observed failures from inconclusive results.
-- Avoid conclusions that exceed the evidence collected.
 
-## Diagnostic Flow
+## Implemented Diagnostic Flow
 
-The planned diagnostic flow is:
+The runner in `internal/runner/` currently follows this sequence:
 
-1. Validate the command-line input.
-2. Identify the target hostname, scheme, and port.
-3. Resolve the hostname and retain the returned addresses.
-4. Classify addresses by family.
-5. Attempt bounded TCP connections to applicable addresses.
-6. Perform TLS negotiation for HTTPS targets.
-7. Request and evaluate an HTTP response when applicable.
-8. Aggregate individual results without discarding their evidence.
-9. Render the report.
+1. Validate the diagnostic context and configuration.
+2. Resolve the target hostname.
+3. Preserve the DNS result.
+4. If DNS produces no usable addresses, record why dependent checks were skipped.
+5. Attempt a bounded TCP connection to each resolved IP address independently.
+6. If TLS is enabled, perform a TLS handshake and certificate verification after each successful TCP check.
+7. Record skipped TLS results when the corresponding TCP check does not pass.
+8. Preserve the individual results and aggregate them into a diagnostic report.
 
-DNS resolution and TCP connectivity are implemented as independent checks. The complete command-line workflow and orchestration of these checks remain future work.
+DNS is performed once per run. TCP checks are performed for each usable address returned by DNS. TLS checks are optional and disabled unless enabled through runner configuration.
 
-Each stage should produce a result that describes its own outcome. A prerequisite failure must not be converted into a successful result for a dependent check. Where a prerequisite is unavailable, dependent checks should be marked as skipped or otherwise unavailable with an explanation.
+A failure against one address does not automatically prevent attempts against remaining addresses. Cancellation of the parent context affects subsequent operations; the runner records skipped results for checks that it cannot attempt.
 
-A failed check must not erase evidence collected by earlier successful checks. The final report should preserve individual outcomes so that partial success remains visible.
+The runner returns configuration or internal execution errors as Go errors. Ordinary network outcomes are represented in diagnostic results and retained in the report.
 
 ## Components
-
-### Command-line interface
-
-Location: `cmd/netprobe/`
-
-Planned responsibility: argument parsing, input validation, configuration, invoking the diagnostic runner, rendering output, and returning a documented exit status.
-
-The command-line interface is not yet implemented.
-
-### Diagnostic model and runner
-
-Location: `internal/diagnostic/`
-
-The diagnostic model defines individual check results and aggregates them into a report.
-
-Implemented capabilities include:
-
-- A result model with status, required-check metadata, duration, message, error, and structured details.
-- Validation of diagnostic results.
-- JSON serialization of individual results.
-- Report aggregation that preserves individual results and derives an overall summary.
-
-The runner responsible for executing checks in the required order, managing shared cancellation and deadlines, and retaining partial results remains future work.
 
 ### Network checks
 
 Location: `internal/checks/`
 
-This package contains individual network diagnostic checks.
+This package contains the individual network operations. The checks use injected dependencies so that their behavior can be tested without relying on public DNS servers or public network services.
 
 #### DNS resolution
 
-The DNS check resolves a hostname through an injected resolver dependency.
+Implementation: `internal/checks/dns.go`
 
-It records the hostname, resolution duration, returned IPv4 and IPv6 addresses, and the number of usable addresses. It removes invalid and duplicate addresses and sorts the resulting addresses for deterministic output.
+The DNS check resolves the target hostname through a resolver dependency.
 
-A resolution failure is represented as a diagnostic result. Context cancellation and deadline expiration are classified as inconclusive because the operation did not complete within the available context.
+It:
+
+- Validates its context, resolver, and hostname.
+- Records the hostname and operation duration.
+- Filters invalid addresses.
+- Normalizes IPv4-mapped IPv6 addresses.
+- Removes duplicate addresses.
+- Sorts addresses for deterministic results.
+- Retains IPv4 and IPv6 addresses separately.
+- Records the number of usable addresses.
+- Represents resolution failures as diagnostic results.
+- Classifies context cancellation and deadline expiration as inconclusive.
+
+A successful DNS result establishes that the resolver returned usable IP addresses. It does not establish that those addresses accept connections.
 
 #### TCP connectivity
 
-The TCP check attempts to establish a connection to a specific IP address and port through an injected dialer.
+Implementation: `internal/checks/tcp.go`
 
-It does not resolve hostnames. Keeping resolution separate allows the diagnostic workflow to distinguish a DNS failure from a TCP connection failure.
+The TCP check attempts to establish a connection to a literal IP address and port through an injected dialer. It does not perform DNS resolution.
 
-The check:
+It:
 
-- Validates its context, dialer, IP address, port, and timeout.
-- Uses an explicit timeout while respecting an earlier parent-context deadline.
-- Formats IPv4 and IPv6 targets correctly.
-- Records the target address, port, configured timeout, and operation duration.
-- Classifies connection failures as failed results.
-- Classifies context cancellation and deadline expiration as inconclusive results.
-- Closes successful connections before returning.
+- Validates the context, dialer, IP address, port, and timeout.
+- Uses a bounded connection attempt.
+- Respects an earlier deadline imposed by the parent context.
+- Formats IPv4 and IPv6 destinations correctly.
+- Records the destination, port, configured timeout, and duration.
+- Represents ordinary connection failures as failed results.
+- Classifies cancellation and deadline expiration as inconclusive.
+- Closes a successful connection after measuring connection establishment.
 
-A successful TCP check establishes that a TCP connection was opened. It does not establish that the application protocol is healthy, that TLS negotiation will succeed, or that an HTTP request will receive a successful response.
+A successful TCP check establishes that a connection was opened to the selected IP address and port. It does not prove that the application protocol is healthy or that TLS or HTTP will succeed.
 
-The check relies on the supplied dialer respecting context cancellation. A dialer that ignores its context may prevent the operation from returning promptly.
+The check depends on the supplied dialer respecting context cancellation. A custom dialer that ignores its context may not return promptly.
 
-#### Planned checks
+#### TLS negotiation and certificate verification
 
-TLS negotiation and HTTP response evaluation are planned capabilities. They have not yet been implemented.
+Implementation: `internal/checks/tls.go`
 
-The initial implementation should prefer Go's standard library over shelling out to system commands.
+The TLS check connects to a literal IP address and port, then performs a TLS handshake.
 
-Linux-specific route inspection may be considered later as a separate capability.
+It:
 
-### Reporting
+- Validates its context, dialer, address, hostname, port, and timeout.
+- Uses a bounded operation that respects an earlier parent-context deadline.
+- Uses the original target hostname for TLS server-name handling and certificate verification.
+- Requires normal certificate verification.
+- Uses Go's system certificate pool when no custom root pool is supplied.
+- Requires at least TLS 1.2.
+- Records the target address, hostname, port, timeout, and outcome.
+- Includes negotiated TLS version, cipher suite, and verified-chain count on success.
+- Classifies ordinary handshake or verification failures as failed results.
+- Classifies cancellation and deadline expiration as inconclusive.
+- Closes the TLS connection after the check.
 
-Location: `internal/report/`
+The runner invokes TLS only when enabled and only after the TCP check for the corresponding address passes.
 
-Planned responsibility: rendering diagnostic results as human-readable text or JSON.
+The TLS check opens its own connection. Therefore, the preceding TCP result and the TLS result are separate observations rather than measurements of one reused connection.
 
-Reporting code must not perform network operations or independently infer root causes. It should present the evidence and summary produced by the diagnostic model and runner.
+A successful TLS check establishes that the handshake and certificate verification succeeded under the configured trust settings. It does not establish that an HTTP endpoint or application function is healthy.
 
-The reporting package is not yet implemented.
+### Diagnostic model and report aggregation
+
+Location: `internal/diagnostic/`
+
+This package defines the structures used to represent and aggregate diagnostic evidence.
+
+Implemented capabilities include:
+
+- Individual results with a name, status, required-check flag, duration, message, optional error, and structured details.
+- Validation of individual results.
+- JSON serialization with durations expressed in nanoseconds.
+- A report containing the target, start time, total duration, overall status, and individual results.
+- Validation of reports and their individual results.
+- Derivation of overall status from required results.
+- Mapping of report status to a process exit-code value.
+
+The overall status is derived using these rules:
+
+1. A failed required check makes the overall report failed.
+2. Otherwise, a required check that is inconclusive or skipped makes the report inconclusive.
+3. If no required checks exist, the report is inconclusive.
+4. Otherwise, all required checks passed and the report is passed.
+
+Optional results remain visible but do not determine the overall status when all required checks pass.
+
+The exit-code mapping is implemented as a method on the report model. The command-line interface that would use the mapping and terminate the process has not been implemented.
+
+### Diagnostic runner
+
+Location: `internal/runner/`
+
+The runner validates configuration, executes checks in dependency order, preserves individual outcomes, and builds the final report.
+
+Its configuration includes:
+
+- Target hostname.
+- Destination port.
+- DNS timeout.
+- TCP timeout.
+- TLS timeout.
+- Whether TLS checks are enabled.
+- An optional TLS certificate root pool.
+- Resolver and dialer dependencies.
+
+DNS and TCP timeouts must be greater than zero. The TLS timeout must be greater than zero when TLS is enabled. The target, port, resolver, dialer, and context must also be valid.
+
+The runner performs DNS resolution once. If DNS does not produce usable addresses, it records skipped TCP results and, when TLS is enabled, skipped TLS results.
+
+For each usable address, the runner performs a TCP check. If TLS is enabled, it performs a TLS check only after that address's TCP result passes. Otherwise, it records why the TLS check was skipped.
+
+The runner preserves results across addresses and aggregates them through the diagnostic report model. It does not attempt HTTP requests.
+
+### Command-line interface
+
+Planned location: `cmd/netprobe/`
+
+The CLI is not yet implemented.
+
+Its intended responsibilities are:
+
+- Parse command-line arguments.
+- Validate user input and configuration.
+- Construct the runner configuration.
+- Invoke the diagnostic runner.
+- Present the diagnostic report.
+- Return a documented process exit status.
+- Distinguish invalid invocation or internal errors from ordinary network outcomes.
+
+### User-facing reporting
+
+A dedicated human-readable reporting layer is not yet implemented.
+
+Individual results and reports support JSON serialization through the diagnostic model. This does not yet provide a complete user-facing JSON command or a command-line application.
+
+Future presentation code should format the results produced by the runner. It must not perform network operations or independently infer root causes.
 
 ## Address-Family Isolation
 
-IPv4 and IPv6 results must remain distinct. Success with one family must not hide failure with the other.
+IPv4 and IPv6 results must remain distinct. Success with one address does not prove that another address is reachable.
 
-DNS results retain IPv4 and IPv6 addresses separately. TCP checks operate on individual IP addresses, allowing each address to be tested independently.
+DNS results retain IPv4 and IPv6 addresses separately. The runner performs TCP checks against individual addresses, preserving each check's outcome.
 
-When a diagnostic workflow evaluates multiple addresses, it should preserve the outcome for each attempted address rather than treating one successful connection as proof that every address is reachable.
+A failed connection to one address does not automatically prevent attempts against other addresses unless the parent context has been canceled or has expired.
 
-When connecting to a selected IP address, TLS Server Name Indication (SNI) and certificate verification must still use the intended hostname. Certificate verification must not be disabled to force a successful result.
+When TLS connects to a resolved IP address, server-name handling and certificate verification use the original target hostname. Certificate verification must not be disabled as a workaround for failed checks.
 
-## Timeouts and Resources
+## Timeouts and Resource Management
 
-Every network operation must have an explicit time limit. Connections and response bodies must be closed appropriately.
+DNS, TCP, and TLS operations are bounded by configured timeouts and the parent execution context.
 
-The DNS and TCP checks accept contexts so that callers can control cancellation and deadlines. The TCP check additionally accepts a connection timeout. Its effective deadline must not extend beyond an earlier deadline imposed by its parent context.
+An operation's effective deadline must not extend beyond an earlier deadline imposed by the parent context.
 
-Timeouts and cancellation should be distinguishable from other errors when the available error information permits it.
+Cancellation and timeout outcomes must be distinguished from ordinary failures when the available error information permits it. An inconclusive result means the operation did not establish its outcome within the available execution context; it is not proof that the destination is unreachable.
 
-An inconclusive result indicates that the check could not establish its outcome within the available execution context. It must not be treated as proof that the destination is unreachable.
-
-Resource ownership must remain explicit. A successful TCP connection is closed by the TCP check because the check only measures connection establishment and does not maintain a session.
+Successful TCP and TLS connections are closed by their respective checks. NetProbe does not maintain persistent connections or run as a background service.
 
 ## Testing
 
-Use deterministic unit tests and controlled local servers where practical. Automated tests must not depend on public Internet access.
+Core behavior is covered by unit tests using controlled dependencies and local test infrastructure where appropriate. Routine automated tests should not depend on public Internet access.
 
 Tests should cover:
 
-- Successful operations.
-- Connection and resolution failures.
+- Successful DNS, TCP, and TLS operations.
+- Resolution, connection, handshake, and certificate-verification failures.
 - Invalid inputs and dependencies.
-- Timeouts and context cancellation.
+- Timeout and cancellation behavior.
 - Parent-context deadlines.
-- IPv4 and IPv6 behavior.
-- Partial success and independent address outcomes.
-- Skipped or unavailable dependent checks.
-- Result validation and report serialization.
-- Appropriate resource cleanup.
+- IPv4 and IPv6 address handling.
+- Independent outcomes for multiple resolved addresses.
+- Skipped dependent checks.
+- TLS being disabled or enabled.
+- Result validation and report aggregation.
+- JSON serialization and resource cleanup.
 
-The DNS and TCP checks use injected dependencies to test behavior without requiring live DNS servers or public network services.
-
-Public Internet experiments should be documented separately from automated tests. Experimental observations must include enough context to explain what was tested and must not be presented as universal guarantees.
+Public network experiments should be documented separately from automated tests. Experimental observations must identify the tested environment and must not be presented as universal guarantees.
 
 ## Initial Non-Goals
 
-The first milestone excludes:
+The current scope excludes:
 
-- A background daemon or continuous monitoring.
+- A background daemon or continuous monitoring service.
+- HTTP response diagnostics.
 - Packet capture.
 - Dashboards or a metrics backend.
 - Cloud and Kubernetes integrations.
 - Automatic network configuration changes.
-- Definitive root-cause claims unsupported by the collected evidence.
+- Privileged commands invoked implicitly.
+- Definitive root-cause claims unsupported by collected evidence.
+
+These boundaries may change as the project develops, but new capabilities should be documented and tested before being described as implemented.

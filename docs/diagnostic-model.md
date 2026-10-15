@@ -2,19 +2,19 @@
 
 ## Purpose
 
-NetProbe evaluates network connectivity through a sequence of diagnostic checks. Each check produces an observation about a particular operation, such as DNS resolution, a TCP connection, a TLS handshake, or an HTTP request.
+NetProbe evaluates network connectivity through distinct diagnostic operations. Each check records an observation about a specific operation, such as DNS resolution, a TCP connection attempt, or a TLS handshake and certificate verification.
 
 The diagnostic model preserves individual observations and derives an overall status from the checks designated as required.
 
-The model separates three concerns:
+The implementation separates three concerns:
 
-1. Individual check execution and evidence collection.
-2. Aggregation of check results into an overall diagnostic status.
-3. Translation of the overall status into a process exit code.
+1. Executing network checks and collecting evidence.
+2. Aggregating check results into an overall diagnostic status.
+3. Mapping the overall status to a process exit-code value.
 
-This separation allows diagnostic policy to be tested independently of network operations and command-line execution.
+These responsibilities are implemented in separate packages. The network checks live in `internal/checks/`, the runner in `internal/runner/`, and the result and report model in `internal/diagnostic/`.
 
-The result model and report aggregation are implemented. DNS resolution and TCP connectivity checks are also implemented as independent operations. The complete diagnostic runner, reporting layer, and command-line interface remain future work.
+The runner, result aggregation, JSON serialization, and report exit-code mapping are implemented. The command-line interface and user-facing report rendering are not yet implemented.
 
 ## Individual Results
 
@@ -22,19 +22,19 @@ Each diagnostic result contains:
 
 - `name`: a stable identifier for the check.
 - `status`: the outcome of the check.
-- `required`: whether the check must pass for the overall diagnostic to succeed.
-- `duration_ns`: the duration of the check in nanoseconds when serialized as JSON.
+- `required`: whether the result contributes directly to the overall diagnostic status.
+- `duration_ns`: the operation duration in nanoseconds when serialized as JSON.
 - `message`: a concise description of the outcome.
 - `error`: optional error information.
 - `details`: optional structured evidence.
 
-The internal implementation represents durations using Go's `time.Duration`. JSON output uses an integer field named `duration_ns` to make the unit explicit.
+The internal implementation represents durations using Go's `time.Duration`. JSON serialization uses the integer field `duration_ns` to make the unit explicit.
 
 The result model validates the check name, status, duration, and message. A result must have a non-empty name and message, a recognized status, and a non-negative duration.
 
-Operational failures are represented as diagnostic results when the check can produce a meaningful outcome. Invalid input or dependencies are returned as Go errors when the check cannot be executed correctly.
+Operational network outcomes are represented as diagnostic results when the check can produce a meaningful outcome. Invalid input or dependencies are returned as Go errors when a check cannot be executed correctly.
 
-This distinction prevents ordinary network failures from being confused with invalid configuration or programming errors.
+The runner also returns Go errors for invalid configuration and execution failures that prevent it from producing a valid report. This distinction prevents ordinary network outcomes from being confused with invalid configuration or internal errors.
 
 ### Result Statuses
 
@@ -46,13 +46,17 @@ A successful DNS lookup establishes that the resolver returned usable IP address
 
 A successful TCP check establishes that a connection was opened to the specified IP address and port. It does not establish that TLS negotiation, application authentication, or an HTTP request will succeed.
 
+A successful TLS check establishes that the TLS handshake completed and certificate verification succeeded under the configured trust settings. It does not establish that an HTTP endpoint or application function is healthy.
+
 #### Failed
 
 The check produced evidence that its success condition was not satisfied.
 
 A DNS resolution failure is evidence that the attempted lookup did not produce a usable result.
 
-A TCP connection refusal or another connection error is evidence that the attempted connection was unsuccessful. It does not, by itself, establish why the remote endpoint refused or failed to accept the connection.
+A TCP connection error is evidence that the attempted connection was unsuccessful. It does not, by itself, establish why the remote endpoint failed to accept the connection.
+
+A TLS failure means the TLS connection, handshake, or certificate verification did not succeed. The result alone does not necessarily establish the underlying cause.
 
 The failed status describes the check's outcome, not a definitive explanation of the underlying fault.
 
@@ -62,9 +66,16 @@ The check was not executed because it was not applicable or its prerequisites we
 
 A skipped check does not automatically establish a network failure. However, a required check that is skipped prevents NetProbe from claiming that all required checks passed.
 
-For example, if DNS resolution produces no usable address, a dependent TCP check cannot be performed against a resolved destination. The eventual diagnostic runner must preserve the DNS result and explain why the dependent check was skipped.
+The runner records skipped results in these situations:
 
-The current DNS and TCP functions execute individual checks. Consistent handling of skipped dependent checks belongs to the orchestration layer.
+- DNS does not produce usable addresses, so TCP checks cannot proceed.
+- TLS is enabled but DNS produces no usable addresses.
+- TLS is enabled but the corresponding TCP check does not pass.
+- The diagnostic context has been canceled or has expired before a remaining address can be checked.
+
+Skipped results include a message explaining why the check was not attempted. Where an address is known, the runner includes it in the result details.
+
+Skipped results are preserved in the report and participate in aggregation according to their `required` value.
 
 #### Inconclusive
 
@@ -74,7 +85,9 @@ A timeout or cancellation may produce an inconclusive result when the operation 
 
 The DNS check classifies context cancellation and deadline expiration as inconclusive outcomes.
 
-The TCP check also classifies context cancellation and deadline expiration as inconclusive. Ordinary connection failures remain failed outcomes.
+The TCP check classifies context cancellation and deadline expiration as inconclusive. Ordinary connection failures remain failed outcomes.
+
+The TLS check also classifies cancellation and deadline expiration as inconclusive. Other TLS connection, handshake, and certificate-verification failures are represented as failed outcomes.
 
 The distinction between failed and inconclusive must follow the semantics of the individual check. Inconclusive must not be used to disguise an ordinary connection failure or an internal programming error.
 
@@ -84,13 +97,17 @@ A result's `required` field determines whether its status contributes directly t
 
 Required checks represent the conditions that must be satisfied for the diagnostic to be considered successful.
 
-Optional checks provide additional information. Their results remain visible in the report, but an optional failure does not override an otherwise successful set of required checks.
+Optional results provide additional information. They remain visible in the report, but an optional failure does not override an otherwise successful set of required checks.
 
-The required-check policy must be established by the diagnostic configuration and documented for each supported invocation.
+The current DNS, TCP, and TLS check implementations mark their results as required.
 
-A result must not be marked optional merely to make an unsuccessful diagnostic return success.
+TLS is optional at the runner-configuration level: it is disabled by default and can be enabled through `Config.EnableTLS`. When enabled, the runner treats each produced TLS result as required. A TLS result skipped because its prerequisite did not pass is also marked required.
 
-The current DNS and TCP checks mark their results as required. The eventual runner and configuration layer must determine whether that policy is appropriate for each diagnostic invocation, particularly when evaluating multiple addresses or optional protocol checks.
+This distinction matters: optional configuration does not mean optional report status. With TLS enabled, a failed, inconclusive, or skipped TLS result can affect the overall report.
+
+The current runner does not expose a separate configuration option to make TLS results optional in report aggregation.
+
+A result must not be marked optional merely to make an unsuccessful diagnostic return success. Any future required-check policy should be explicit and documented.
 
 ## Overall Status
 
@@ -105,58 +122,91 @@ Aggregation follows these rules in order:
 
 An empty result set is therefore inconclusive.
 
-Optional results do not change the overall status when all required checks pass. They are still retained in the report and must remain available to users and programmatic consumers.
+Optional results do not change the overall status when all required checks pass. They are still retained in the report and remain available to users and programmatic consumers.
 
 A failed required check takes precedence over an inconclusive or skipped required check. This ordering ensures that an established failure is not concealed by another check that could not complete.
 
-## Partial Success
+The aggregation logic is implemented in `internal/diagnostic/report.go`. The report constructor validates individual results, retains the supplied result collection, and derives the overall status. Report validation checks that the stored status agrees with the aggregation policy.
 
-NetProbe must preserve the result of each individual check.
+## Partial Success and Address Isolation
+
+NetProbe preserves the result of each individual check.
 
 For example, a target may have working IPv4 connectivity and failing IPv6 connectivity. The report must retain both observations rather than collapsing them into a single Boolean value.
 
-DNS resolution can return both IPv4 and IPv6 addresses. The DNS check retains the usable addresses by family and removes duplicates. TCP checks operate on individual IP addresses, allowing each selected destination to be tested independently.
+DNS resolution runs once per diagnostic invocation. The DNS check retains usable IPv4 and IPv6 addresses separately, normalizes IPv4-mapped IPv6 addresses, removes duplicates, and sorts the resulting addresses for deterministic output.
 
-A successful TCP connection to one address does not establish that other addresses are reachable. Similarly, a successful DNS lookup does not establish that any returned address accepts connections.
+The runner performs a TCP check for each usable address. A failure against one address does not automatically prevent attempts against the remaining addresses. Cancellation or expiration of the parent context affects subsequent attempts.
 
-The overall status depends on which checks are required for the invocation. The result collection must not discard useful partial success or conceal an individual failure.
+When TLS is enabled, the runner performs a TLS check only after the corresponding TCP check passes. The TLS check opens its own connection, so the TCP and TLS results represent separate observations.
 
-The diagnostic runner must define how per-address results contribute to the overall status. That policy should preserve address-family isolation and must not allow success on one address to silently erase failure on another required address.
+The runner preserves individual results in execution order. It does not treat success against one address as proof that every resolved address is reachable.
 
-## Process Exit Codes
+Because the current checks mark their results as required, a failed required check for one address can make the overall report fail even when another address succeeds. The aggregation policy does not silently erase that failure.
 
-The CLI maps the overall report status to a process exit code.
+## Diagnostic Runner
 
-| Exit code | Meaning |
-|---|---|
-| `0` | All required, applicable checks passed. |
-| `1` | A required check failed, the result was inconclusive, or no required checks established success. |
-| `2` | Invalid command-line arguments or configuration. |
-| `3` | An internal error prevented production of a valid diagnostic report. |
+The runner is implemented in `internal/runner/runner.go`.
 
-Exit codes `2` and `3` are reserved for errors handled by the CLI layer. They are not ordinary network-check outcomes.
+It validates the diagnostic context and configuration, resolves the target, executes the applicable checks, preserves individual outcomes, and builds a report through the diagnostic model.
 
-A failed TCP connection, for example, should normally appear as a valid diagnostic result and contribute to exit code `1` when that check is required. It should not be treated as an internal execution error.
+The runner configuration includes:
 
-The diagnostic package does not terminate the process. It returns the report and exposes the exit-code decision. Process termination belongs to the CLI entry point.
+- Target hostname.
+- Destination port.
+- DNS timeout.
+- TCP timeout.
+- TLS timeout.
+- TLS enablement.
+- An optional TLS root certificate pool.
+- Resolver and dialer dependencies.
 
-The exit-code mapping is the intended CLI contract. The CLI entry point and its process-termination behavior have not yet been implemented.
+The target must not be empty. The port must be within the valid TCP port range. DNS and TCP timeouts must be greater than zero, and the TLS timeout must be greater than zero when TLS is enabled. The context, resolver, and dialer must not be nil.
 
-## Report Structure
+DNS resolution is performed once. If DNS does not produce usable addresses, the runner preserves the DNS result and adds skipped results for dependent checks.
+
+For each usable address, the runner attempts TCP connectivity. If TLS is enabled and the TCP check passes, the runner performs a TLS handshake and certificate verification using the original target hostname.
+
+The runner bounds network operations with configured timeouts and the parent context. An earlier parent-context deadline takes precedence over a configured timeout.
+
+The runner returns configuration or execution errors as Go errors when it cannot produce a valid report. Ordinary network outcomes remain in the diagnostic result collection.
+
+## Report Structure and JSON Serialization
 
 A report contains:
 
 - `target`: the requested diagnostic target.
 - `started_at`: the diagnostic start timestamp.
-- `duration_ns`: the total diagnostic duration in nanoseconds.
+- `duration_ns`: total diagnostic duration in nanoseconds when serialized as JSON.
 - `status`: the derived overall status.
 - `results`: the ordered collection of individual results.
 
-The report validates its basic fields and individual results. It also checks that the stored overall status agrees with the aggregation policy.
+The report model validates its basic fields and individual results. It also checks that the stored overall status agrees with the aggregation policy.
 
-Individual result ordering should reflect the diagnostic execution plan so that consumers can interpret the sequence consistently.
+Individual results preserve execution order so that consumers can interpret the sequence of checks consistently.
 
-The report model is responsible for retaining the evidence produced by individual checks. It must not independently perform network operations or infer a root cause from the result collection.
+The report and individual result types implement JSON serialization. Durations are emitted as integer nanosecond values through fields named `duration_ns`; the internal Go representation remains `time.Duration`.
+
+JSON serialization support does not mean a complete command-line JSON output mode exists. The CLI and user-facing presentation layer remain future work.
+
+The report model retains evidence produced by the checks. It does not independently perform network operations or infer a root cause from the result collection.
+
+## Process Exit Codes
+
+The report model implements `ExitCode()`, which maps the overall report status to a process exit-code value.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | All required checks passed. |
+| `1` | A required check failed, the report was inconclusive, or required checks did not establish success. |
+| `2` | Reserved for invalid command-line arguments or configuration errors handled by the CLI. |
+| `3` | Reserved for internal errors that prevent production of a valid diagnostic report. |
+
+The current `ExitCode()` method maps a passed report to `0`, failed or inconclusive reports to `1`, and an unrecognized report status to `3`.
+
+Exit codes `2` and `3` describe the intended CLI contract for errors handled outside ordinary check results. They are not separate network-check statuses. The report model does not terminate the process.
+
+The command-line interface has not yet been implemented, so these values are not yet exposed through a complete user-facing command.
 
 ## Evidence and Interpretation
 
@@ -176,6 +226,7 @@ Other examples illustrate the same boundary:
 - A successful DNS lookup does not prove that a destination is reachable.
 - A successful TCP connection does not prove that the application protocol is healthy.
 - A TCP connection failure does not uniquely identify whether the cause lies in the local host, routing path, firewall policy, remote host, or service.
+- A TLS verification failure does not automatically identify which configuration or trust issue caused it.
 - A timeout establishes that an operation did not complete within the available time limit. It does not necessarily establish that the destination is unreachable.
 
 Diagnostic messages should describe the operation and its outcome without asserting causes that the collected evidence cannot establish.
@@ -184,18 +235,14 @@ Structured details should retain useful evidence for further inspection. They sh
 
 ## Implementation Boundaries
 
-The diagnostic model is independent of network operations.
+The current implementation is organized into three primary layers:
 
-Network checks are responsible for executing bounded operations and producing individual results. The diagnostic layer retains those results and derives the overall status. The reporting layer serializes the report, while the CLI handles argument errors, internal failures, and process exit.
+- `internal/checks/` executes individual DNS, TCP, and TLS operations.
+- `internal/runner/` sequences checks, applies dependencies, and preserves partial results.
+- `internal/diagnostic/` validates results, aggregates report status, serializes JSON, and maps report status to an exit-code value.
 
-The implemented DNS and TCP checks accept injected dependencies so that their core behavior can be tested without depending on public Internet access.
+The command-line interface, HTTP response checks, and user-facing report rendering are not yet implemented.
 
-The DNS check accepts a resolver abstraction. The TCP check accepts a dialer abstraction and operates on a literal IP address and port, keeping DNS resolution separate from connection establishment.
+Changes to result statuses, required-check semantics, aggregation rules, TLS behavior, or exit-code mapping must be reflected in the implementation, tests, and documentation.
 
-The TCP check uses a timeout derived from its parent context. An earlier parent-context deadline takes precedence over the check's configured timeout. Prompt cancellation depends on the supplied dialer respecting the context.
-
-The current checks produce individual results. The runner that sequences them, manages shared execution limits, handles dependencies, and preserves partial results remains future work.
-
-Unit tests for result validation, aggregation, DNS behavior, and TCP behavior must not depend on public Internet access.
-
-Changes to result statuses, required-check semantics, aggregation rules, or exit codes must be reflected in both the tests and this document.
+Unit tests should remain deterministic and must not depend on public Internet access for routine verification.
