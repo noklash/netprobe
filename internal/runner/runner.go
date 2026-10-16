@@ -5,6 +5,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/noklash/netprobe/internal/checks"
@@ -32,6 +34,31 @@ type Config struct {
 	// When nil, Go uses the system certificate pool.
 	TLSRoots *x509.CertPool
 
+	// EnableHTTP enables an independent HTTP response check.
+	//
+	// The HTTP request uses HTTPURL directly. It does not reuse the
+	// connections or resolved addresses from the DNS/TCP/TLS checks.
+	EnableHTTP bool
+
+	// HTTPURL is the absolute URL to request when HTTP is enabled.
+	//
+	// The URL must use HTTP or HTTPS and include a hostname.
+	HTTPURL string
+
+	// HTTPExpectedStatus is the exact HTTP status code expected
+	// from the configured endpoint.
+	HTTPExpectedStatus int
+
+	// HTTPTimeout bounds the HTTP request.
+	HTTPTimeout time.Duration
+
+	// HTTPClient optionally supplies the HTTP client used by the
+	// HTTP check. When nil, http.DefaultClient is used.
+	//
+	// The HTTP check clones the client to enforce its redirect
+	// policy without changing the supplied client.
+	HTTPClient *http.Client
+
 	Resolver checks.Resolver
 	Dialer   checks.Dialer
 }
@@ -46,9 +73,12 @@ type Config struct {
 // attempts against remaining addresses unless the parent context is
 // canceled.
 //
-// When TLS is enabled, TLS is attempted only after the TCP check for the
-// corresponding address succeeds. TLS certificate verification uses the
-// original target hostname, not the resolved IP address.
+// When TLS is enabled, TLS is attempted only after the TCP check for
+// the corresponding address succeeds. TLS certificate verification uses
+// the original target hostname, not the resolved IP address.
+//
+// When HTTP is enabled, one independent HTTP request is made against
+// HTTPURL. It does not depend on the DNS, TCP, or TLS outcomes above.
 func Run(
 	ctx context.Context,
 	config Config,
@@ -90,6 +120,12 @@ func Run(
 		)
 	}
 
+	if config.EnableHTTP {
+		if err := validateHTTPConfig(config); err != nil {
+			return diagnostic.Report{}, err
+		}
+	}
+
 	if config.Resolver == nil {
 		return diagnostic.Report{}, errors.New(
 			"resolver must not be nil",
@@ -129,8 +165,9 @@ func Run(
 
 	results = append(results, dnsResult)
 
-	// Without a successful DNS result and usable addresses, neither
-	// TCP nor TLS can be attempted meaningfully.
+	// Without a successful DNS result and usable addresses, dependent
+	// TCP and TLS checks cannot proceed. An enabled HTTP check remains
+	// independent and must still be attempted.
 	if dnsResult.Status != diagnostic.StatusPassed ||
 		len(addresses) == 0 {
 		results = append(results, skippedTCPResult(
@@ -145,6 +182,12 @@ func Run(
 				"",
 				"TLS check skipped because DNS did not produce usable addresses",
 			))
+		}
+
+		if config.EnableHTTP {
+			if err := appendHTTPResult(ctx, config, &results); err != nil {
+				return diagnostic.Report{}, err
+			}
 		}
 
 		return newReport(
@@ -242,11 +285,90 @@ func Run(
 		results = append(results, tlsResult)
 	}
 
+	// HTTP is evaluated once, separately from the per-address checks.
+	// Its result is retained even if a TCP or TLS check failed.
+	if config.EnableHTTP {
+		if err := appendHTTPResult(ctx, config, &results); err != nil {
+			return diagnostic.Report{}, err
+		}
+	}
+
 	return newReport(
 		config.Target,
 		startedAt,
 		results,
 	)
+}
+
+// validateHTTPConfig validates HTTP configuration before any network
+// operations begin.
+func validateHTTPConfig(config Config) error {
+	parsedURL, err := url.Parse(config.HTTPURL)
+	if err != nil {
+		return fmt.Errorf("invalid HTTP URL: %w", err)
+	}
+
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		return errors.New(
+			"HTTP URL scheme must be http or https when HTTP is enabled",
+		)
+	}
+
+	if parsedURL.Host == "" || parsedURL.Hostname() == "" {
+		return errors.New(
+			"HTTP URL must include a hostname when HTTP is enabled",
+		)
+	}
+
+	if parsedURL.User != nil {
+		return errors.New(
+			"HTTP URL must not contain user information",
+		)
+	}
+
+	if config.HTTPExpectedStatus < 100 ||
+		config.HTTPExpectedStatus > 599 {
+		return fmt.Errorf(
+			"HTTP expected status must be between 100 and 599: %d",
+			config.HTTPExpectedStatus,
+		)
+	}
+
+	if config.HTTPTimeout <= 0 {
+		return errors.New(
+			"HTTP timeout must be greater than zero when HTTP is enabled",
+		)
+	}
+
+	return nil
+}
+
+// appendHTTPResult performs the independent HTTP check and appends its
+// diagnostic result to the report results.
+func appendHTTPResult(
+	ctx context.Context,
+	config Config,
+	results *[]diagnostic.Result,
+) error {
+	client := config.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	httpResult, err := checks.CheckHTTP(
+		ctx,
+		client,
+		config.HTTPURL,
+		config.HTTPExpectedStatus,
+		config.HTTPTimeout,
+	)
+	if err != nil {
+		return fmt.Errorf("run HTTP diagnostic: %w", err)
+	}
+
+	*results = append(*results, httpResult)
+
+	return nil
 }
 
 // skippedTCPResult records a TCP check that could not be attempted.
@@ -324,5 +446,3 @@ func newReport(
 
 	return report, nil
 }
-
-// ensure the netip import remains tied to the address-oriented runner API.

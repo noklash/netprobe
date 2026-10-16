@@ -82,7 +82,7 @@ func TestResolveDNS(t *testing.T) {
 		{
 			name: "invalid addresses are ignored",
 			addresses: []netip.Addr{
-				netip.Addr{},
+				{},
 				netip.MustParseAddr("192.0.2.30"),
 			},
 			wantStatus:     diagnostic.StatusPassed,

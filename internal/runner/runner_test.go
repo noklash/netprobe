@@ -10,6 +10,8 @@ import (
 	"errors"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"reflect"
 	"strconv"
@@ -128,7 +130,7 @@ func TestRunDNSFailureSkipsTCP(t *testing.T) {
 	}
 
 	if report.Results[0].Name != "dns" {
-		t.Fatalf(
+		t.Errorf(
 			"first result name = %q, want dns",
 			report.Results[0].Name,
 		)
@@ -179,7 +181,6 @@ func TestRunChecksEveryResolvedAddress(t *testing.T) {
 		t.Fatalf("Run() returned unexpected error: %v", err)
 	}
 
-	// The runner processes the IPv4 address before the IPv6 address.
 	wantAttempts := []string{
 		"192.0.2.10:443",
 		"[2001:db8::10]:443",
@@ -863,5 +864,411 @@ func TestRunDNSFailureSkipsTLSWhenEnabled(t *testing.T) {
 
 	if err := report.Validate(); err != nil {
 		t.Fatalf("report validation failed: %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// HTTP runner tests
+// -----------------------------------------------------------------------------
+
+func TestRunHTTPCheckPasses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				t.Errorf("HTTP method = %q, want GET", r.Method)
+			}
+
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+	defer server.Close()
+
+	resolver := &fakeResolver{
+		addresses: []netip.Addr{
+			netip.MustParseAddr("192.0.2.10"),
+		},
+	}
+	dialer := &fakeDialer{}
+
+	config := testConfig(resolver, dialer)
+	config.EnableHTTP = true
+	config.HTTPURL = server.URL
+	config.HTTPExpectedStatus = http.StatusOK
+	config.HTTPTimeout = time.Second
+
+	report, err := Run(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Run() returned unexpected error: %v", err)
+	}
+
+	if len(report.Results) != 3 {
+		t.Fatalf(
+			"got %d results, want 3 (DNS, TCP, HTTP)",
+			len(report.Results),
+		)
+	}
+
+	httpResult := report.Results[2]
+
+	if httpResult.Name != "http" {
+		t.Errorf(
+			"third result name = %q, want http",
+			httpResult.Name,
+		)
+	}
+
+	if httpResult.Status != diagnostic.StatusPassed {
+		t.Errorf(
+			"HTTP status = %q, want passed; message: %s",
+			httpResult.Status,
+			httpResult.Message,
+		)
+	}
+
+	if report.Status != diagnostic.StatusPassed {
+		t.Errorf(
+			"report status = %q, want passed",
+			report.Status,
+		)
+	}
+
+	if err := report.Validate(); err != nil {
+		t.Fatalf("report validation failed: %v", err)
+	}
+}
+
+func TestRunHTTPCheckFailsOnUnexpectedStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		},
+	))
+	defer server.Close()
+
+	resolver := &fakeResolver{
+		addresses: []netip.Addr{
+			netip.MustParseAddr("192.0.2.10"),
+		},
+	}
+	dialer := &fakeDialer{}
+
+	config := testConfig(resolver, dialer)
+	config.EnableHTTP = true
+	config.HTTPURL = server.URL
+	config.HTTPExpectedStatus = http.StatusOK
+	config.HTTPTimeout = time.Second
+
+	report, err := Run(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Run() returned unexpected error: %v", err)
+	}
+
+	if len(report.Results) != 3 {
+		t.Fatalf(
+			"got %d results, want 3 (DNS, TCP, HTTP)",
+			len(report.Results),
+		)
+	}
+
+	httpResult := report.Results[2]
+
+	if httpResult.Name != "http" {
+		t.Errorf(
+			"third result name = %q, want http",
+			httpResult.Name,
+		)
+	}
+
+	if httpResult.Status != diagnostic.StatusFailed {
+		t.Errorf(
+			"HTTP status = %q, want failed",
+			httpResult.Status,
+		)
+	}
+
+	if report.Status != diagnostic.StatusFailed {
+		t.Errorf(
+			"report status = %q, want failed",
+			report.Status,
+		)
+	}
+
+	if err := report.Validate(); err != nil {
+		t.Fatalf("report validation failed: %v", err)
+	}
+}
+
+func TestRunHTTPCheckRunsAfterDNSFailure(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			select {
+			case requestReceived <- struct{}{}:
+			default:
+			}
+
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+	defer server.Close()
+
+	resolver := &fakeResolver{
+		err: errors.New("DNS server unavailable"),
+	}
+	dialer := &fakeDialer{}
+
+	config := testConfig(resolver, dialer)
+	config.EnableHTTP = true
+	config.HTTPURL = server.URL
+	config.HTTPExpectedStatus = http.StatusOK
+	config.HTTPTimeout = time.Second
+
+	report, err := Run(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Run() returned unexpected error: %v", err)
+	}
+
+	select {
+	case <-requestReceived:
+		// The independent HTTP request was received.
+	default:
+		t.Fatal("HTTP request was not received after DNS failure")
+	}
+
+	if len(report.Results) != 3 {
+		t.Fatalf(
+			"got %d results, want 3 (DNS, TCP skipped, HTTP)",
+			len(report.Results),
+		)
+	}
+
+	if report.Results[0].Name != "dns" ||
+		report.Results[0].Status != diagnostic.StatusFailed {
+		t.Errorf(
+			"DNS result = (%q, %q), want (dns, failed)",
+			report.Results[0].Name,
+			report.Results[0].Status,
+		)
+	}
+
+	if report.Results[1].Name != "tcp" ||
+		report.Results[1].Status != diagnostic.StatusSkipped {
+		t.Errorf(
+			"TCP result = (%q, %q), want (tcp, skipped)",
+			report.Results[1].Name,
+			report.Results[1].Status,
+		)
+	}
+
+	if report.Results[2].Name != "http" ||
+		report.Results[2].Status != diagnostic.StatusPassed {
+		t.Errorf(
+			"HTTP result = (%q, %q), want (http, passed)",
+			report.Results[2].Name,
+			report.Results[2].Status,
+		)
+	}
+
+	// A passing HTTP endpoint does not erase the DNS failure.
+	if report.Status != diagnostic.StatusFailed {
+		t.Errorf(
+			"report status = %q, want failed",
+			report.Status,
+		)
+	}
+
+	if err := report.Validate(); err != nil {
+		t.Fatalf("report validation failed: %v", err)
+	}
+}
+
+func TestRunHTTPCheckRunsAfterTCPFailure(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, _ *http.Request) {
+			select {
+			case requestReceived <- struct{}{}:
+			default:
+			}
+
+			w.WriteHeader(http.StatusOK)
+		},
+	))
+	defer server.Close()
+
+	resolver := &fakeResolver{
+		addresses: []netip.Addr{
+			netip.MustParseAddr("192.0.2.10"),
+		},
+	}
+
+	dialer := &fakeDialer{
+		outcomes: map[string]error{
+			"192.0.2.10:443": errors.New("connection refused"),
+		},
+	}
+
+	config := testConfig(resolver, dialer)
+	config.EnableHTTP = true
+	config.HTTPURL = server.URL
+	config.HTTPExpectedStatus = http.StatusOK
+	config.HTTPTimeout = time.Second
+
+	report, err := Run(context.Background(), config)
+	if err != nil {
+		t.Fatalf("Run() returned unexpected error: %v", err)
+	}
+
+	select {
+	case <-requestReceived:
+		// The independent HTTP request was received.
+	default:
+		t.Fatal("HTTP request was not received after TCP failure")
+	}
+
+	if len(report.Results) != 3 {
+		t.Fatalf(
+			"got %d results, want 3 (DNS, TCP, HTTP)",
+			len(report.Results),
+		)
+	}
+
+	if report.Results[1].Name != "tcp" ||
+		report.Results[1].Status != diagnostic.StatusFailed {
+		t.Errorf(
+			"TCP result = (%q, %q), want (tcp, failed)",
+			report.Results[1].Name,
+			report.Results[1].Status,
+		)
+	}
+
+	if report.Results[2].Name != "http" ||
+		report.Results[2].Status != diagnostic.StatusPassed {
+		t.Errorf(
+			"HTTP result = (%q, %q), want (http, passed)",
+			report.Results[2].Name,
+			report.Results[2].Status,
+		)
+	}
+
+	// A passing HTTP endpoint does not erase the TCP failure.
+	if report.Status != diagnostic.StatusFailed {
+		t.Errorf(
+			"report status = %q, want failed",
+			report.Status,
+		)
+	}
+
+	if err := report.Validate(); err != nil {
+		t.Fatalf("report validation failed: %v", err)
+	}
+}
+
+func TestRunRejectsInvalidHTTPConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*Config)
+	}{
+		{
+			name: "empty URL",
+			change: func(c *Config) {
+				c.HTTPURL = ""
+			},
+		},
+		{
+			name: "unsupported URL scheme",
+			change: func(c *Config) {
+				c.HTTPURL = "ftp://example.test"
+			},
+		},
+		{
+			name: "missing URL host",
+			change: func(c *Config) {
+				c.HTTPURL = "http:///path"
+			},
+		},
+		{
+			name: "zero HTTP timeout",
+			change: func(c *Config) {
+				c.HTTPTimeout = 0
+			},
+		},
+		{
+			name: "negative HTTP timeout",
+			change: func(c *Config) {
+				c.HTTPTimeout = -time.Second
+			},
+		},
+		{
+			name: "invalid expected status below range",
+			change: func(c *Config) {
+				c.HTTPExpectedStatus = 99
+			},
+		},
+		{
+			name: "invalid expected status above range",
+			change: func(c *Config) {
+				c.HTTPExpectedStatus = 600
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := &fakeResolver{}
+			dialer := &fakeDialer{}
+
+			config := testConfig(resolver, dialer)
+			config.EnableHTTP = true
+			config.HTTPURL = "http://example.test"
+			config.HTTPExpectedStatus = http.StatusOK
+			config.HTTPTimeout = time.Second
+
+			tt.change(&config)
+
+			_, err := Run(context.Background(), config)
+			if err == nil {
+				t.Fatal(
+					"Run() error = nil, want HTTP configuration error",
+				)
+			}
+
+			if resolver.calls != 0 {
+				t.Errorf(
+					"resolver calls = %d, want 0 for invalid configuration",
+					resolver.calls,
+				)
+			}
+
+			if len(dialer.attempts) != 0 {
+				t.Errorf(
+					"dial attempts = %v, want none for invalid configuration",
+					dialer.attempts,
+				)
+			}
+		})
+	}
+}
+
+func TestRunHTTPDisabledDoesNotRequireConfiguration(t *testing.T) {
+	config := testConfig(
+		&fakeResolver{},
+		&fakeDialer{},
+	)
+
+	config.EnableHTTP = false
+	config.HTTPURL = ""
+	config.HTTPExpectedStatus = 0
+	config.HTTPTimeout = 0
+	config.HTTPClient = nil
+
+	_, err := Run(context.Background(), config)
+	if err != nil {
+		t.Fatalf(
+			"Run() returned unexpected error with HTTP disabled: %v",
+			err,
+		)
 	}
 }
